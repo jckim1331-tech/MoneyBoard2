@@ -2,8 +2,10 @@ import os
 import re
 import sys
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime
+from tracemalloc import start
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import FastAPI
@@ -538,6 +540,8 @@ class KiwoomController(QObject):
         }
 
     def rising_amount_rank(self, limit: int = 50, markets: Optional[List[str]] = None) -> Dict[str, Any]:
+        #추가
+        start = time.perf_counter()
         if not self.login:
             return {'ok': False, 'error': 'Kiwoom login required'}
 
@@ -571,6 +575,9 @@ class KiwoomController(QObject):
                 'rankingBasis': 'rising-amount',
                 'updatedAt': now_iso(),
             })
+
+            elapsed = time.perf_counter() - start
+            print(f"[PERF] rising_amount_rank : {elapsed:.3f} sec")
 
         return {
             'ok': True,
