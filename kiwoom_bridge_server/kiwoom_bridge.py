@@ -188,6 +188,16 @@ class KiwoomController(QObject):
         self.ocx.OnEventConnect.connect(self._on_event_connect)
         self.ocx.OnReceiveTrData.connect(self._on_receive_tr_data)
         self.ocx.OnReceiveRealData.connect(self._on_receive_real_data)
+        
+        #self.rising_amount_cache = None
+        #self.rising_amount_cache_time = 0
+        #self.rising_amount_cache_lock = threading.Lock()
+
+        # key: (limit, markets)
+        self.rising_amount_cache: Dict[tuple, Dict[str, Any]] = {}
+        self.rising_amount_cache_lock = threading.Lock()
+        
+
 
         self.login = False
         self.login_error: Optional[int] = None
@@ -209,6 +219,7 @@ class KiwoomController(QObject):
         self.current_quotes: Dict[str, Dict[str, Any]] = {}
         self.master: Dict[str, Dict[str, Any]] = {}
         self.candidates: Dict[str, Dict[str, Any]] = {}
+        self.rising_amount_cache_rows: List[Dict[str, Any]] = []
         self._tr_loop: Optional[QEventLoop] = None
         self._tr_rows: List[Dict[str, Any]] = []
         self._tr_error: Optional[str] = None
@@ -382,6 +393,16 @@ class KiwoomController(QObject):
             selected = ranked[:limit]
 
             self.candidates = {item['code']: item for item in selected}
+
+            self.rising_amount_cache_rows = sorted(
+                self.candidates.values(),
+                key=lambda x: (
+                    int(x.get("tradeAmountMillion") or 0),
+                    int(x.get("volume") or 0),
+                ),
+                reverse=True,
+            )
+
             self._hydrate_master(list(self.candidates.keys()))
             self._subscribe_realtime(list(self.candidates.keys()))
 
@@ -502,8 +523,13 @@ class KiwoomController(QObject):
         if not ranking_rows and market_list != MARKETS:
             market_list = MARKETS
             for market in market_list:
-                self._merge_rank_rows(ranking_rows, self._request_amount_rank(market), 'amountRank', market)
-                pause(TR_DELAY_MS)
+                self._merge_rank_rows(
+                    ranking_rows,
+                    self._request_amount_rank(market),
+                    "amountRank",
+                    market,
+            )
+            pause(TR_DELAY_MS)
 
         rows = sorted(
             ranking_rows.values(),
@@ -545,43 +571,88 @@ class KiwoomController(QObject):
     def rising_amount_rank(self, limit: int = 50, markets: Optional[List[str]] = None) -> Dict[str, Any]:
         #추가
         start = time.perf_counter()
+        
         if not self.login:
             return {'ok': False, 'error': 'Kiwoom login required'}
 
-        ranking_rows: Dict[str, Dict[str, Any]] = {}
-        market_list = [item for item in (markets or AMOUNT_RANK_MARKETS) if item]
-        for market in market_list:
-            self._merge_rank_rows(ranking_rows, self._request_amount_rank(market), 'amountRank', market)
-            pause(TR_DELAY_MS)
-        if not ranking_rows and market_list != MARKETS:
-            market_list = MARKETS
-            for market in market_list:
-                self._merge_rank_rows(ranking_rows, self._request_amount_rank(market), 'amountRank', market)
-                pause(TR_DELAY_MS)
+        now = time.time()
 
+        with self.rising_amount_cache_lock:
+            if (
+                self.rising_amount_cache is not None
+                and now - self.rising_amount_cache_time < 3
+            ):
+                print(f"[CACHE] rising_amount_rank : {time.perf_counter()-start:.3f} sec")
+                return self.rising_amount_cache
+
+
+        # refresh_candidates()에서 미리 만들어 둔 캐시 사용
+        rows = self.rising_amount_cache_rows.copy()
+
+        
         rows = [item for item in ranking_rows.values() if is_rising_rank_row(item)]
+        
         rows.sort(
-            key=lambda item: (int(item.get('tradeAmountMillion') or 0), int(item.get('volume') or 0)),
-            reverse=True,
-        )
+             key=lambda item: (
+                int(item.get("tradeAmountMillion") or 0),
+                int(item.get("volume") or 0),
+        ),
+        reverse=True,
+    )
         rows = rows[:max(1, min(int(limit or 50), 100))]
-        self._hydrate_master([row['code'] for row in rows])
+
+        self._hydrate_master([row["code"] for row in rows])
 
         items = []
+
         for index, item in enumerate(rows, start=1):
-            master = self.master.get(item['code'], {})
+            master = self.master.get(item["code"], {})
+
             items.append({
                 **item,
-                'rank': index,
-                'sector': master.get('sector') or '미분류',
-                'sourceLabel': '키움상승거래대금순TR',
-                'rankingBasis': 'rising-amount',
-                'updatedAt': now_iso(),
+                "rank": index,
+                "sector": master.get("sector") or "미분류",
+                "sourceLabel": "키움상승거래대금순TR",
+                "rankingBasis": "rising-amount",
+                "updatedAt": now_iso(),
             })
 
-            elapsed = time.perf_counter() - start
-            print(f"[PERF] rising_amount_rank : {elapsed:.3f} sec")
+        result = {
+            "ok": True,
+            "provider": "Kiwoom OpenAPI+ opt10032 rising-filter",
+            "updatedAt": now_iso(),
+            "exchangeType": EXCHANGE_TYPE,
+            "exchangeTypeLabel": {
+                "1": "KRX",
+                "2": "NXT",
+                "3": "통합",
+            }.get(EXCHANGE_TYPE, EXCHANGE_TYPE),
+            "criteria": {
+                "rank": "rising-daily-trade-amount",
+                "changeFilter": "change-rate-positive",
+                "sort": "tradeAmountMillion-desc",
+                "limit": limit,
+                "markets": market_list,
+            },
+            "items": items,
+            "stats": {
+                "count": len(items),
+                "totalTradeAmountMillion": sum(
+                    int(item.get("tradeAmountMillion") or 0)
+                    for item in items
+                ),
+            },
+        }   
 
+        with self.rising_amount_cache_lock:
+            self.rising_amount_cache = result
+            self.rising_amount_cache_time = time.time()
+
+        print(f"[PERF] rising_amount_rank : {time.perf_counter()-start:.3f} sec")
+
+        return result
+
+        /*
         return {
             'ok': True,
             'provider': 'Kiwoom OpenAPI+ opt10032 rising-filter',
@@ -601,6 +672,7 @@ class KiwoomController(QObject):
                 'totalTradeAmountMillion': sum(int(item.get('tradeAmountMillion') or 0) for item in items),
             },
         }
+         */
 
     def _request_daily_trade_detail(self, code: str, start_date: str) -> List[Dict[str, Any]]:
         normalized_code = clean_code(code)
