@@ -1,0 +1,286 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+
+Verdict = Literal["사라", "조건부로 사라", "사지 마라", "기다려라", "팔아라", "보유하라", "분석 중단"]
+
+
+@dataclass(frozen=True)
+class PriceEvidence:
+    label: str
+    price: int
+    reasons: tuple[str, ...]
+
+    def summary(self) -> str:
+        return f"{self.label} {format_price(self.price)}: {', '.join(self.reasons)} 근거"
+
+
+@dataclass(frozen=True)
+class DecisionLevels:
+    support: PriceEvidence | None
+    confirmation: PriceEvidence | None
+    breakout: PriceEvidence | None
+    stop: PriceEvidence | None
+    no_chase: PriceEvidence | None
+    target1: PriceEvidence | None = None
+    target2: PriceEvidence | None = None
+
+
+@dataclass(frozen=True)
+class DecisionContext:
+    current_price: int
+    levels: DecisionLevels
+    is_intraday: bool
+    data_valid: bool = True
+    invalid_reasons: tuple[str, ...] = ()
+    volume_ratio20: float | None = None
+    rsi14: float | None = None
+    bollinger_upper: float | None = None
+    risk_reward: float | None = None
+
+
+@dataclass(frozen=True)
+class DecisionResult:
+    verdict: Verdict
+    headline: str
+    actions: tuple[str, ...]
+    buy_conditions: tuple[str, ...]
+    no_buy_conditions: tuple[str, ...]
+    sell_conditions: tuple[str, ...]
+    holder_conditions: tuple[str, ...]
+    price_evidence: tuple[PriceEvidence, ...]
+    blocking_errors: tuple[str, ...] = ()
+    final_action_state: str = ""
+
+    @property
+    def stopped(self) -> bool:
+        return self.verdict == "분석 중단" or bool(self.blocking_errors)
+
+
+def evaluate_decision(ctx: DecisionContext) -> DecisionResult:
+    missing = _missing_required_evidence(ctx.levels)
+    if not ctx.data_valid or ctx.invalid_reasons or missing:
+        errors = tuple(ctx.invalid_reasons) + tuple(missing)
+        return DecisionResult(
+            verdict="분석 중단",
+            headline="데이터 검증 실패: 명령형 매매 지시를 중단합니다",
+            actions=("데이터가 다시 검증될 때까지 매수·매도 조건을 확정하지 마라.",),
+            buy_conditions=("매수 조건 없음.",),
+            no_buy_conditions=("정상 리포트 저장 금지.",),
+            sell_conditions=("기존 보유 판단도 별도 확인 전까지 자동화하지 마라.",),
+            holder_conditions=("데이터 회복 전까지 이 리포트로 추가매수하지 마라.",),
+            price_evidence=_evidence_tuple(ctx.levels),
+            blocking_errors=errors,
+            final_action_state="NO_BUY_DATA_INVALID",
+        )
+
+    levels = ctx.levels
+    assert levels.support and levels.confirmation and levels.stop and levels.no_chase
+    current = ctx.current_price
+    rsi_overheated = ctx.rsi14 is not None and ctx.rsi14 >= 70
+    near_bollinger_upper = ctx.bollinger_upper is not None and current >= ctx.bollinger_upper * 0.98
+    weak_rr = ctx.risk_reward is not None and ctx.risk_reward < 1.0
+
+    if current < levels.stop.price:
+        verdict: Verdict = "팔아라"
+        headline = "방어선 이탈: 매수 관점 폐기"
+        actions = (f"{format_price(levels.stop.price)} 이탈 상태이므로 팔아라 또는 비중 축소하라.",)
+        final_state = "DEFENSE_REQUIRED"
+    elif current >= levels.no_chase.price:
+        verdict = "사지 마라"
+        headline = "추격 금지선 이상: 신규매수 금지"
+        actions = (
+            "지금 바로 시장가로 사지 마라.",
+            f"{format_price(levels.no_chase.price)} 이상은 추격 금지선 이상이므로 신규매수하지 마라.",
+        )
+        final_state = "NO_BUY_OVERHEATED_BAD_RR"
+    elif rsi_overheated and near_bollinger_upper:
+        verdict = "사지 마라"
+        headline = "RSI 과열·볼린저밴드 상단 근처: 신규매수 금지"
+        actions = (
+            "지금 바로 시장가로 사지 마라.",
+            f"RSI 70 이상이고 볼린저밴드 상단 근처이므로 {format_price(levels.no_chase.price)} 아래로 식기 전까지 추격 매수하지 마라.",
+        )
+        final_state = "NO_BUY_OVERHEATED_BAD_RR"
+    elif current < levels.support.price:
+        verdict = "사지 마라"
+        headline = "핵심 지지선 아래: 회복 전 신규매수 금지"
+        actions = (f"지금 사지 마라. {format_price(levels.support.price)} 회복 전까지 신규매수하지 마라.",)
+        final_state = "NO_BUY_BELOW_RECOVERY"
+    elif rsi_overheated and weak_rr:
+        verdict = "사지 마라"
+        headline = "과열·손익비 부족: 추격매수 금지"
+        actions = (f"지금 바로 시장가로 사지 마라. {format_price(levels.no_chase.price)} 이상에서는 추격 매수하지 마라.",)
+        final_state = "NO_BUY_OVERHEATED_BAD_RR"
+    elif levels.breakout and current >= levels.breakout.price:
+        if ctx.is_intraday:
+            verdict = "조건부로 사라"
+            headline = "장중 돌파 시도: 3분봉 또는 5분봉 종가 유지 필요, 오늘 종가 확인 필요"
+            actions = (
+                "지금 바로 시장가로 사지 마라.",
+                f"{format_price(levels.breakout.price)} 이상을 거래량 동반해 3분봉 또는 5분봉 종가로 유지할 때만 1차 매수하라. 오늘 종가 확인 필요.",
+            )
+            final_state = "WATCH_INTRADAY_BREAKOUT"
+        else:
+            verdict = "사라"
+            headline = "일봉 종가 돌파 확인: 분할 매수 가능"
+            actions = (f"{format_price(levels.breakout.price)} 위 일봉 종가 돌파 확인 상태이므로 1차 분할 매수 가능하다.",)
+            final_state = "BREAKOUT_CONFIRMED"
+    elif current >= levels.confirmation.price and not weak_rr:
+        verdict = "조건부로 사라"
+        headline = "지지 후 회복 확인: 조건부 1차 매수"
+        if ctx.is_intraday:
+            actions = (
+                "지금 바로 시장가로 사지 마라.",
+                f"{format_price(levels.support.price)}을 깨지 않고 {format_price(levels.confirmation.price)} 이상에서 3분봉 또는 5분봉 종가가 마감될 때만 1차 매수하라.",
+            )
+            final_state = "WAIT_RECOVERY_CLOSE"
+        else:
+            actions = (
+                "지금 바로 시장가로 사지 마라.",
+                f"다음 거래일에 {format_price(levels.support.price)}을 깨지 않고 {format_price(levels.confirmation.price)} 이상을 유지할 때만 1차 매수를 검토하라.",
+            )
+            final_state = "HOLD_AND_TRAIL"
+    elif levels.support.price <= current < levels.confirmation.price:
+        verdict = "기다려라"
+        headline = "지지 구간 안: 회복 확인 전 대기"
+        actions = (f"아직 사지 마라. {format_price(levels.confirmation.price)} 이상 회복 종가가 필요하다.",)
+        final_state = "WAIT_RECOVERY_CLOSE"
+    else:
+        verdict = "보유하라"
+        headline = "매수·매도 신호 사이: 보유자는 기준선 관리"
+        actions = (f"보유자는 {format_price(levels.support.price)} 이탈 전까지 보유하라.",)
+        final_state = "HOLD_AND_TRAIL"
+
+    buy_conditions = (
+        _entry_condition(levels, current, ctx.is_intraday),
+        _breakout_condition(levels, ctx.is_intraday),
+    )
+    no_buy_conditions = _no_buy_conditions(levels, current, ctx.is_intraday)
+    sell_conditions = (f"{format_price(levels.stop.price)} 이탈 시 팔아라 또는 비중 축소하라.",)
+    holder_conditions = (_holder_condition(levels, current),)
+    return DecisionResult(
+        verdict=verdict,
+        headline=headline,
+        actions=actions,
+        buy_conditions=buy_conditions,
+        no_buy_conditions=no_buy_conditions,
+        sell_conditions=sell_conditions,
+        holder_conditions=holder_conditions,
+        price_evidence=_evidence_tuple(levels),
+        final_action_state=final_state,
+    )
+
+
+def format_price(price: int | float | None) -> str:
+    if price is None:
+        return "해당 없음"
+    return f"{int(round(price)):,}원"
+
+
+def _breakout_condition(levels: DecisionLevels, is_intraday: bool) -> str:
+    if not levels.breakout:
+        return "돌파 매수: 근거 있는 돌파선 없음"
+    suffix = "거래량 동반해 5분봉 종가로 유지 시" if is_intraday else "일봉 종가 돌파 확인 시"
+    return f"돌파 매수: {format_price(levels.breakout.price)} 이상을 {suffix}"
+
+
+def _entry_condition(levels: DecisionLevels, current: int, is_intraday: bool) -> str:
+    assert levels.support and levels.confirmation
+    support = levels.support.price
+    confirmation = levels.confirmation.price
+    if support > current and support >= confirmation:
+        suffix = "3분봉 또는 5분봉 종가 유지 시" if is_intraday else "일봉 종가 안착 시"
+        return f"회복 매수: {format_price(confirmation)} 회복 후 {format_price(support)} 이상에서 {suffix}"
+    if support > confirmation:
+        suffix = "3분봉 또는 5분봉 종가 안착 시" if is_intraday else "일봉 종가 안착 시"
+        return f"회복 매수: {format_price(confirmation)} 회복 후 {format_price(support)} 이상 {suffix}"
+    return f"지지 매수: {format_price(support)} 지지 후 {format_price(confirmation)} 회복 시"
+
+
+def _no_buy_conditions(levels: DecisionLevels, current: int, is_intraday: bool) -> tuple[str, str]:
+    assert levels.support and levels.no_chase
+    support = levels.support.price
+    if is_intraday:
+        if support > current:
+            first = f"{format_price(support)} 회복 전이거나 이 가격 아래에서 5분봉 종가가 마감되면 사지 마라."
+        else:
+            first = f"{format_price(support)} 아래에서 5분봉 종가가 마감되면 사지 마라."
+    else:
+        if support > current:
+            first = f"다음 거래일에 {format_price(support)} 이상 일봉 종가 안착 전까지 사지 마라."
+        else:
+            first = f"다음 거래일에 {format_price(support)} 아래로 밀리거나 일봉 종가가 이 가격 아래이면 사지 마라."
+    return (first, f"{format_price(levels.no_chase.price)} 이상에서는 추격 매수하지 마라.")
+
+
+def _holder_condition(levels: DecisionLevels, current: int) -> str:
+    assert levels.support and levels.stop
+    support = levels.support.price
+    stop = levels.stop.price
+    if support == stop:
+        return f"보유자는 {format_price(stop)} 이탈 시 추가매수 보류 및 방어/손절하라."
+    if current < support:
+        return f"보유자는 {format_price(support)} 회복 실패 구간에서는 추가매수 보류, {format_price(stop)} 이탈 시 방어/손절하라."
+    return f"보유자는 {format_price(support)} 이탈 시 추가매수 보류, {format_price(stop)} 이탈 시 방어/손절하라."
+
+
+def _missing_required_evidence(levels: DecisionLevels) -> list[str]:
+    required = {
+        "핵심 지지선": levels.support,
+        "매수 확인선": levels.confirmation,
+        "손절/방어선": levels.stop,
+        "추격 금지선": levels.no_chase,
+    }
+    errors: list[str] = []
+    for label, evidence in required.items():
+        if evidence is None or evidence.price <= 0 or not evidence.reasons:
+            errors.append(f"{label} 가격 근거 부족")
+    if levels.breakout is not None and not levels.breakout.reasons:
+        errors.append("돌파선 가격 근거 부족")
+    return errors
+
+
+def _evidence_tuple(levels: DecisionLevels) -> tuple[PriceEvidence, ...]:
+    """Return display evidence without duplicated semantic price rows.
+
+    Keep the original breakout row when target1 is the same object/price.
+    Suppress only the duplicate target1 role and suppress target2 when it is
+    the same price as the no-chase line, because that price is a stop-chasing
+    boundary rather than a clean profit target.
+    """
+
+    ordered: tuple[tuple[str, PriceEvidence | None], ...] = (
+        ("support", levels.support),
+        ("confirmation", levels.confirmation),
+        ("breakout", levels.breakout),
+        ("no_chase", levels.no_chase),
+        ("stop", levels.stop),
+        ("target1", levels.target1),
+        ("target2", levels.target2),
+    )
+    output: list[PriceEvidence] = []
+    seen: set[tuple[str, int, tuple[str, ...]]] = set()
+
+    for role, evidence in ordered:
+        if evidence is None:
+            continue
+        if (
+            role == "target1"
+            and levels.breakout is not None
+            and evidence.price == levels.breakout.price
+            and evidence.reasons == levels.breakout.reasons
+        ):
+            continue
+        if role == "target2" and levels.no_chase is not None and evidence.price == levels.no_chase.price:
+            continue
+
+        key = (evidence.label, evidence.price, evidence.reasons)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(evidence)
+
+    return tuple(output)
