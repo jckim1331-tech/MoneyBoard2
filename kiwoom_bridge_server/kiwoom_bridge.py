@@ -10,6 +10,9 @@ from collections import defaultdict
 from datetime import datetime
 from tracemalloc import start
 from typing import Any, Callable, Dict, List, Optional
+from cache.market_cache import MarketDataCache
+
+#from matplotlib.pyplot import pause
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -189,9 +192,11 @@ class KiwoomController(QObject):
         self.ocx.OnReceiveTrData.connect(self._on_receive_tr_data)
         self.ocx.OnReceiveRealData.connect(self._on_receive_real_data)
         
-        #self.rising_amount_cache = None
-        #self.rising_amount_cache_time = 0
-        #self.rising_amount_cache_lock = threading.Lock()
+        # ===========================
+        # Market Cache
+        # ===========================
+        self.market_cache = MarketDataCache()
+
 
         # key: (limit, markets)
         self.rising_amount_cache: Dict[tuple, Dict[str, Any]] = {}
@@ -241,6 +246,29 @@ class KiwoomController(QObject):
         self.current_quote_timer.timeout.connect(lambda: self.refresh_current_quotes(CURRENT_QUOTE_BATCH_LIMIT))
         if ALLOW_CURRENT_TR_FALLBACK:
             self.current_quote_timer.start(max(30000, CURRENT_QUOTE_POLL_MS))
+
+    def _collect_market_data(self) -> Dict[str, Dict[str, Any]]:
+        ranking_rows: Dict[str, Dict[str, Any]] = {}
+
+        for market in MARKETS:
+            self._merge_rank_rows(
+                ranking_rows,
+                self._request_volume_rank(market),
+                "volumeRank",
+                market,
+            )
+            pause(TR_DELAY_MS)
+
+            self._merge_rank_rows(
+                ranking_rows,
+                self._request_amount_rank(market),
+                "amountRank",
+                market,
+            )
+            pause(TR_DELAY_MS)
+
+        return ranking_rows
+
 
     @pyqtSlot(object)
     def _handle_bridge_call(self, payload: Dict[str, Any]) -> None:
@@ -381,12 +409,14 @@ class KiwoomController(QObject):
             return
         self._refreshing = True
         try:
-            ranking_rows: Dict[str, Dict[str, Any]] = {}
-            for market in MARKETS:
-                self._merge_rank_rows(ranking_rows, self._request_volume_rank(market), 'volumeRank', market)
-                pause(TR_DELAY_MS)
-                self._merge_rank_rows(ranking_rows, self._request_amount_rank(market), 'amountRank', market)
-                pause(TR_DELAY_MS)
+            collect_start = time.perf_counter()
+
+            ranking_rows = self._collect_market_data()
+
+            print(
+                f"[PERF] collect_market_data : "
+                f"{time.perf_counter() - collect_start:.3f}s"
+            )
 
             ranked = rank_candidates(list(ranking_rows.values()))
             limit = max(1, min(int(max_codes or MAX_REALTIME_CODES), 300))
@@ -652,27 +682,7 @@ class KiwoomController(QObject):
 
         return result
 
-        /*
-        return {
-            'ok': True,
-            'provider': 'Kiwoom OpenAPI+ opt10032 rising-filter',
-            'updatedAt': now_iso(),
-            'exchangeType': EXCHANGE_TYPE,
-            'exchangeTypeLabel': {'1': 'KRX', '2': 'NXT', '3': '통합'}.get(EXCHANGE_TYPE, EXCHANGE_TYPE),
-            'criteria': {
-                'rank': 'rising-daily-trade-amount',
-                'changeFilter': 'change-rate-positive',
-                'sort': 'tradeAmountMillion-desc',
-                'limit': limit,
-                'markets': market_list,
-            },
-            'items': items,
-            'stats': {
-                'count': len(items),
-                'totalTradeAmountMillion': sum(int(item.get('tradeAmountMillion') or 0) for item in items),
-            },
-        }
-         */
+      
 
     def _request_daily_trade_detail(self, code: str, start_date: str) -> List[Dict[str, Any]]:
         normalized_code = clean_code(code)
