@@ -1,3 +1,4 @@
+from doctest import master
 import os
 import re
 import sys
@@ -10,12 +11,19 @@ from collections import defaultdict
 from datetime import datetime
 from tracemalloc import start
 from typing import Any, Callable, Dict, List, Optional
-from cache.market_cache import MarketDataCache
 
+#from pykrx import stock
+from cache.market_cache import MarketDataCache
+from cache.sector_cache import SectorCache
+from collector.market_collector import MarketCollector
 #from matplotlib.pyplot import pause
+from builder.sector_builder import SectorBuilder
+
+
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
 from pydantic import BaseModel
 from PyQt5.QtCore import QObject, QEventLoop, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QApplication
@@ -196,8 +204,10 @@ class KiwoomController(QObject):
         # Market Cache
         # ===========================
         self.market_cache = MarketDataCache()
-
-
+        self.sector_cache = SectorCache()
+        self.sector_builder = SectorBuilder()
+        
+        
         # key: (limit, markets)
         self.rising_amount_cache: Dict[tuple, Dict[str, Any]] = {}
         self.rising_amount_cache_lock = threading.Lock()
@@ -248,28 +258,132 @@ class KiwoomController(QObject):
             self.current_quote_timer.start(max(30000, CURRENT_QUOTE_POLL_MS))
 
     def _collect_market_data(self) -> Dict[str, Dict[str, Any]]:
+        
+        MARKET_TR_DELAY_MS = 100
         ranking_rows: Dict[str, Dict[str, Any]] = {}
 
         for market in MARKETS:
-            self._merge_rank_rows(
-                ranking_rows,
-                self._request_volume_rank(market),
-                "volumeRank",
-                market,
-            )
-            pause(TR_DELAY_MS)
-
             self._merge_rank_rows(
                 ranking_rows,
                 self._request_amount_rank(market),
                 "amountRank",
                 market,
             )
-            pause(TR_DELAY_MS)
+            pause(MARKET_TR_DELAY_MS)
 
         return ranking_rows
 
 
+    def _build_market_cache(
+        
+        self,
+        selected: List[Dict[str, Any]],
+        ranked: List[Dict[str, Any]]) -> None:
+     
+        print("_build_market_cache selected =", len(selected))
+     
+     
+        self.market_cache.clear()
+        stocks = {}
+        
+        for item in selected:
+            stock = dict(item)
+            master = self.master.get(stock['code'], {})
+
+        
+            stock['name'] = master.get("name",stock.get("name"))
+            stock["sector"] = master.get("sector", "기타")
+            stock["sectorSource"] = master.get("sectorSource", "")
+            stock["themes"] = master.get("themes", [])
+
+            stocks[stock["code"]] = stock
+
+        self.market_cache.stocks = stocks
+        print("market_cache =", len(self.market_cache.stocks))
+        self.market_cache.ranking = ranked
+
+        self.market_cache.amount_rank = sorted(
+        stocks.values(),
+        key=lambda x: (
+            int(x.get("tradeAmountMillion") or 0),
+            int(x.get("volume") or 0),
+        ),
+        reverse=True,
+    )
+
+        self.market_cache.volume_rank = sorted(
+            stocks.values(),
+            key=lambda x: (
+                int(x.get("volume") or 0),
+                int(x.get("tradeAmountMillion") or 0),
+            ),
+        reverse=True,
+        )
+        
+        self.market_cache.last_update = now_iso()    
+
+    
+    def _build_sector_cache(self) -> None:
+
+        sectors = self.sector_builder.build(
+            self.market_cache.stocks
+        )
+        
+             
+        print("=" * 60)
+        print("[SectorCache] stock count =", len(self.market_cache.stocks))
+        print("[SectorCache] sector count =", len(sectors))
+        print("[SectorCache] sectors =", list(sectors.keys())[:10])
+        print("=" * 60)
+    
+        cards = []
+    
+    
+        for sector, stocks in sectors.items():
+
+            stocks = sorted(
+                stocks,
+                key=lambda x: (
+                    int(x.get("tradeAmountMillion") or 0),
+                    int(x.get("volume") or 0),
+                ),
+                reverse=True,
+            )
+        
+            cards.append({
+                "name": sector,                        # 기존 snapshot과 동일
+                "volume": sum(
+                    int(x.get("volume") or 0)
+                    for x in stocks
+                ),
+                "tradeAmountMillion": sum(
+                    int(x.get("tradeAmountMillion") or 0)
+                    for x in stocks
+                ),
+                "stocks": stocks[:5],                  # 카드 표시용
+            })
+        
+        cards.sort(
+            key=lambda x: (
+                x["tradeAmountMillion"],
+                x["volume"],
+            ),
+            reverse=True,
+        )
+    
+        
+        self.sector_cache.clear()
+        self.sector_cache.sectors = sectors
+        self.sector_cache.cards = cards
+        self.sector_cache.ranking = cards
+        self.sector_cache.last_update = now_iso()
+    
+    
+        
+
+    
+    
+    
     @pyqtSlot(object)
     def _handle_bridge_call(self, payload: Dict[str, Any]) -> None:
         try:
@@ -323,56 +437,24 @@ class KiwoomController(QObject):
         }
 
     def snapshot(self, sector_limit: int, stocks_per_sector: int, sort_key: str) -> Dict[str, Any]:
-        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        realtime_ready = 0
-        current_tr_ready = 0
-        provisional_count = 0
+        
+        limited = self.sector_cache.ranking[:sector_limit]
 
-        for code in self.registered_codes:
-            real_quote = self.quotes.get(code)
-            current_quote = self.current_quotes.get(code)
-            candidate_quote = self.candidates.get(code)
-            quote = real_quote or current_quote or candidate_quote
-            if not quote:
-                continue
+        realtime_ready = len(self.quotes)
+        current_tr_ready = len(self.current_quotes)
+        provisional_count = max(
+            0,
+            len(self.candidates) - realtime_ready - current_tr_ready,
+        )
+        
+        print("=" * 60)
+        print("snapshot sectors =", len(limited))
+        if limited:
+            print("first sector =", limited[0])
+        print("=" * 60)
 
-            stock = self._normalize_stock(code, quote)
-            if stock['excluded']:
-                continue
-
-            if stock['isRealtime']:
-                realtime_ready += 1
-            elif stock['isCurrentTr']:
-                current_tr_ready += 1
-            else:
-                provisional_count += 1
-
-            # 화면 표시값은 기본적으로 키움 실시간 FID 또는 키움 현재가 TR만 사용한다.
-            # opt10030/opt10032 랭킹 TR은 후보 선정용이며, KIWOOM_STRICT_REALTIME=0일 때만 임시 표시한다.
-            if STRICT_REALTIME_ONLY and not (stock['isRealtime'] or stock['isCurrentTr']):
-                continue
-
-            grouped[stock['sector']].append(stock)
-
-        sectors = []
-        for sector_name, stocks in grouped.items():
-            sorted_stocks = sort_stocks(stocks, sort_key)[:stocks_per_sector]
-            if not sorted_stocks:
-                continue
-            sectors.append({
-                'name': sector_name,
-                'volume': sum(stock['volume'] for stock in sorted_stocks),
-                'tradeAmountMillion': sum(stock['tradeAmountMillion'] for stock in sorted_stocks),
-                'stocks': sorted_stocks,
-            })
-
-        if sort_key == 'volume':
-            sectors.sort(key=lambda item: (item['volume'], item['tradeAmountMillion']), reverse=True)
-        else:
-            sectors.sort(key=lambda item: (item['tradeAmountMillion'], item['volume']), reverse=True)
-
-        limited = sectors[:sector_limit]
-        return {
+        return {    
+            
             'ok': self.login,
             'provider': 'Kiwoom OpenAPI+ only',
             'updatedAt': now_iso(),
@@ -389,7 +471,7 @@ class KiwoomController(QObject):
                 'currentTrReadyCount': current_tr_ready,
                 'provisionalCount': provisional_count,
                 'visibleStockCount': sum(len(sector['stocks']) for sector in limited),
-                'sectorCount': len(sectors),
+                'sectorCount': len(self.sector_cache.ranking),
                 'maxRealtimeCodes': MAX_REALTIME_CODES,
                 'candidateRefreshMs': CANDIDATE_REFRESH_MS,
                 'currentQuotePollMs': CURRENT_QUOTE_POLL_MS,
@@ -398,7 +480,9 @@ class KiwoomController(QObject):
                 'lastCandidateRefreshAt': self.last_candidate_refresh_at,
                 'lastCurrentQuoteRefreshAt': self.last_current_quote_refresh_at,
                 'lastRealEventAt': self.last_real_event_at,
+        
             },
+            
         }
 
     @pyqtSlot(int)
@@ -419,11 +503,26 @@ class KiwoomController(QObject):
             )
 
             ranked = rank_candidates(list(ranking_rows.values()))
+            print("ranking =", len(ranked))
+            print(
+                "[PERF] amount only =",
+                len(ranking_rows),
+            )
+            
+            
             limit = max(1, min(int(max_codes or MAX_REALTIME_CODES), 300))
             selected = ranked[:limit]
-
-            self.candidates = {item['code']: item for item in selected}
-
+            print("selected =", len(selected))
+            
+            
+            
+            self.candidates = {
+                item['code']: item 
+                for item in selected
+                
+            }
+            print("candidates =", len(self.candidates))
+            
             self.rising_amount_cache_rows = sorted(
                 self.candidates.values(),
                 key=lambda x: (
@@ -432,8 +531,10 @@ class KiwoomController(QObject):
                 ),
                 reverse=True,
             )
-
+            
             self._hydrate_master(list(self.candidates.keys()))
+            self._build_market_cache(selected, ranked)
+            self._build_sector_cache()
             self._subscribe_realtime(list(self.candidates.keys()))
 
             selected_codes = set(self.candidates.keys())
@@ -1085,7 +1186,7 @@ class KiwoomController(QObject):
             raise RuntimeError(f'CommRqData failed: {trcode} result={result}')
 
         self._tr_loop = QEventLoop()
-        QTimer.singleShot(8000, self._tr_loop.quit)
+        QTimer.singleShot(2000, self._tr_loop.quit)
         self._tr_loop.exec_()
         rows = list(self._tr_rows)
         error = self._tr_error
@@ -1328,6 +1429,17 @@ class KiwoomController(QObject):
         quote.update(amount_meta)
         self.quotes[code] = quote
         self.last_real_event_at = quote['updatedAt']
+
+
+    def _collect_market_codes(self):
+        return MarketCollector.collect(
+            self,
+            MARKETS,
+            TR_DELAY_MS,
+            pause,
+            
+        )
+
 
 
 def pause(ms: int) -> None:
